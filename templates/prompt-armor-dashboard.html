@@ -598,23 +598,7 @@ header { display:flex;align-items:center;justify-content:space-between;margin-bo
 </div><!-- end .shell -->
 
 <script>
-/* ════════════════════════════════════════════════════════════════════
-   PROMPT ARMOR — FIXED DASHBOARD  v5
-   ════════════════════════════════════════════════════════════════════
-   FIXES:
-   1. Single unified WS message handler — no duplicate systems
-   2. api.py sends {"summary":{...}, "daily_counts":{...}, ...}
-      → handleSnapshot() processes it, does proper delta-diffing
-   3. rtPush() called on EVERY delta (including first snapshot if
-      total_requests > 0)
-   4. daily_counts from api.py is { "2024-01-01": int } — handled
-   5. total_requests increments on SANITIZED_REQUEST too (api.py fix
-      embedded in payload handling)
-   6. Graph IDLE=breathing sine, ACTIVE=vivid spike, COOLING=decay
-   7. Demo mode uses handleSnapshot() with realistic cumulative state
-════════════════════════════════════════════════════════════════════ */
-
-/* ── INTRO dismiss ── */
+/* ── INTRO: dismiss after progress bar + buffer ── */
 setTimeout(() => {
   const el = document.getElementById('intro-screen');
   if (!el) return;
@@ -622,760 +606,543 @@ setTimeout(() => {
   setTimeout(() => el.remove(), 720);
 }, 3200);
 
-/* ── Custom cursor ── */
+/* Cursor */
 const cursor = document.getElementById('cursor');
 document.addEventListener('mousemove', e => {
   cursor.style.left = e.clientX + 'px';
   cursor.style.top  = e.clientY + 'px';
 });
 
-/* ════════════════════════════════════════════════════════
-   GRAPH ENGINE
-   ════════════════════════════════════════════════════════
-   · rAF loop runs at 60fps — graph NEVER freezes
-   · IDLE:    sine-wave breathing bars + slow teal line
-   · ACTIVE:  on rtPush() → bars spike bright + tall,
-              green line jumps, pulse ring expands, canvas flashes
-   · COOLING: blend decays smoothly back to IDLE over 3s
-*/
+/* ═══════════════════════════════════════════════════════════════════
+   REAL-TIME REACTIVE GRAPH ENGINE  v4
+   ───────────────────────────────────────────────────────────────────
+   IDLE    → calm breathing sine wave, dim teal bars pulse gently.
+             Graph always scrolls left. Never frozen.
+
+   ACTIVE  → on every rtPush(): bars spike TALL & BRIGHT instantly,
+             green line jumps to show exact sanitized height,
+             canvas flashes, cursor dot pulses outward ring.
+             Bar height = actual total count (scaled).
+             Line height = actual sanitized count (scaled).
+
+   COOLING → after last event, bars & line smoothly decay back
+             to idle sine. Returns to IDLE after ~3 s quiet.
+
+   KEY FIX: bars always render at VISIBLE height (min 25% gH idle,
+   up to 100% gH on spike). Real data values are scaled against a
+   rolling max that decays so single events always look tall.
+═══════════════════════════════════════════════════════════════════ */
 
 const RT_POINTS   = 100;
 const COOLDOWN_MS = 3000;
+const TRANS_MS    = 500;
 
-/* Ring buffer — _idle=true means synthetic/no-data frame */
-const rtData = Array.from({length: RT_POINTS + 80}, (_, i) => ({
-  total: 0, sanitized: 0,
-  ts: Date.now() - (RT_POINTS + 79 - i) * 300,
-  _idle: true
+/* Ring buffer — stores both real events and idle synthetic frames */
+const rtData = Array.from({length: RT_POINTS + 60}, (_,i) => ({
+  total:0, sanitized:0, ts: Date.now()-(RT_POINTS+59-i)*300, _idle:true
 }));
 let rtHead = rtData.length - 1;
 
-/* Rolling max decays slowly so spikes always look proportional */
-let rollingMaxTotal = 5;
-let rollingMaxSan   = 5;
+/* Rolling max with slow decay — makes single events visually tall */
+let rollingMaxTotal = 4;
+let rollingMaxSan   = 4;
 
-/* State machine */
-const ST = { IDLE: 0, ACTIVE: 1, COOLING: 2 };
-let gState      = ST.IDLE;
-let lastEventTs = 0;       /* performance.now() of last rtPush */
-let blend       = 0;       /* 0 = fully idle, 1 = fully active */
+/* State */
+const ST = {IDLE:0, ACTIVE:1, COOLING:2};
+let gState       = ST.IDLE;
+let lastEventTs  = 0;        // performance.now() of last rtPush
+let stateEnterTs = 0;
+let blend        = 0;        // 0=idle, 1=active (smoothly interpolated)
 
-/* Scroll & animation phases */
-let scrollPx  = 0;
-let idlePhase = 0;
-let barPhase  = 0;
+/* Continuous scroll */
+let scrollPx   = 0;
+let idlePhase  = 0;    // sine phase for idle heartbeat
+let barPhase   = 0;    // phase for idle bar breathing
 
-/* Pulse rings spawned on each rtPush */
-let pulseRings = [];
+/* Pulse ring on event */
+let pulseRings = [];   // [{ts, x, y}] — up to 3 simultaneous rings
 
-/* Token counters (cumulative) */
 let tokIn = 0, tokOut = 0;
 
-/* Previous snapshot for delta computation */
-let prevSnap = null;   /* { total_requests, total_sanitized, total_restored } */
-
-/* Canvas refs */
 const barCanvas  = document.getElementById('rtBarCanvas');
 const lineCanvas = document.getElementById('rtLineCanvas');
 const wrap       = document.getElementById('rt-graph-wrap');
 
-function resizeCanvases() {
-  const w = wrap.clientWidth, h = wrap.clientHeight;
-  barCanvas.width = lineCanvas.width = w;
-  barCanvas.height = lineCanvas.height = h;
+function resizeCanvases(){
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  barCanvas.width=lineCanvas.width=w;
+  barCanvas.height=lineCanvas.height=h;
 }
 resizeCanvases();
 window.addEventListener('resize', resizeCanvases);
 
-function clamp01(t)     { return Math.max(0, Math.min(1, t)); }
-function smoothstep(t)  { t = clamp01(t); return t * t * (3 - 2 * t); }
+function clamp01(t){ return Math.max(0,Math.min(1,t)); }
+function smoothstep(t){ t=clamp01(t); return t*t*(3-2*t); }
+function easeOut(t){ return 1-Math.pow(clamp01(1-t),3); }
 
-/* ── Push one REAL data point into ring buffer ── */
-function rtPush(total, sanitized) {
+/* ── Push a REAL data point (called every event) ── */
+function rtPush(total, sanitized){
   const now = performance.now();
 
-  rtHead = (rtHead + 1) % rtData.length;
-  rtData[rtHead] = { total, sanitized, ts: Date.now(), _idle: false };
+  /* Advance ring, store real data */
+  rtHead = (rtHead+1) % rtData.length;
+  rtData[rtHead] = { total, sanitized, ts:Date.now(), _idle:false };
 
-  /* Grow rolling max instantly, decay slowly over time */
-  rollingMaxTotal = Math.max(rollingMaxTotal * 0.88, total, 4);
-  rollingMaxSan   = Math.max(rollingMaxSan   * 0.88, sanitized, 3);
+  /* Update rolling max — spikes feel tall, decays slowly */
+  rollingMaxTotal = Math.max(rollingMaxTotal * 0.92, total, 3);
+  rollingMaxSan   = Math.max(rollingMaxSan   * 0.92, sanitized, 2);
 
-  /* Activate graph */
+  /* Transition state */
   lastEventTs = now;
-  gState = ST.ACTIVE;
-  blend  = Math.min(1, blend + 0.5);   /* instant jump toward active */
-
-  /* Pulse ring at rightmost point */
-  const W = barCanvas.width, H = barCanvas.height;
-  const gH = H - 16;
-  const slotW = W / RT_POINTS;
-  const rx = W - slotW / 2;
-  const sanRatio = clamp01(sanitized / Math.max(1, rollingMaxSan));
-  const ry = 10 + gH * (1 - (0.30 + sanRatio * 0.70));
-  pulseRings.push({ ts: now, x: rx, y: ry, isSan: sanitized > 0 });
-  if (pulseRings.length > 6) pulseRings.shift();
-
-  refreshGraphCounters();
-}
-
-/* ── Stamp idle frame (called when scroll advances one slot) ── */
-function stampIdle() {
-  rtHead = (rtHead + 1) % rtData.length;
-  rtData[rtHead] = { total: 0, sanitized: 0, ts: Date.now(), _idle: true };
-  rollingMaxTotal = Math.max(4, rollingMaxTotal * 0.998);
-  rollingMaxSan   = Math.max(3, rollingMaxSan   * 0.998);
-}
-
-function getView() {
-  const len = rtData.length;
-  return Array.from({ length: RT_POINTS }, (_, i) =>
-    rtData[(rtHead - RT_POINTS + 1 + i + len * 4) % len]
-  );
-}
-
-function refreshGraphCounters() {
-  const view = getView();
-  const sumT = view.reduce((s, d) => s + (d._idle ? 0 : d.total), 0);
-  const sumS = view.reduce((s, d) => s + (d._idle ? 0 : d.sanitized), 0);
-  document.getElementById('rc-total').textContent = sumT.toLocaleString();
-  document.getElementById('rc-san').textContent   = sumS.toLocaleString();
-}
-
-/* ── rAF main loop (never stops) ── */
-function rtLoop(now) {
-  requestAnimationFrame(rtLoop);
-
-  /* Blend toward target based on state */
-  const sinceEvent = now - lastEventTs;
-
-  if (gState === ST.ACTIVE) {
-    blend = Math.min(1, blend + 0.08);
-    if (sinceEvent > 200) gState = ST.COOLING;
-  } else if (gState === ST.COOLING) {
-    const frac = clamp01((sinceEvent - 200) / COOLDOWN_MS);
-    blend = 1 - smoothstep(frac);
-    if (frac >= 1) { gState = ST.IDLE; blend = 0; }
-  } else {
-    blend = Math.max(0, blend - 0.018);
+  if(gState !== ST.ACTIVE){
+    gState      = ST.ACTIVE;
+    stateEnterTs= now;
   }
 
-  /* Scroll: idle=slow, active=fast */
-  const speed = 0.5 + blend * 2.8;
-  scrollPx += speed;
-  const slotW = barCanvas.width / RT_POINTS;
-  if (scrollPx >= slotW) { scrollPx -= slotW; stampIdle(); }
+  /* Spawn pulse ring at the rightmost point */
+  const W=barCanvas.width, H=barCanvas.height;
+  const slotW = W / RT_POINTS;
+  const rx = W - slotW/2;
+  const ry = (H-14) * (1 - clamp01(sanitized/Math.max(1,rollingMaxSan))) + 10;
+  pulseRings.push({ ts:now, x:rx, y:ry });
+  if(pulseRings.length > 4) pulseRings.shift();
 
-  idlePhase += 0.02;
-  barPhase  += 0.03;
+  refreshCounters();
+}
+
+/* ── Stamp idle synthetic point (called by scroll ticker) ── */
+function stampIdle(){
+  rtHead = (rtHead+1) % rtData.length;
+  rtData[rtHead] = { total:0, sanitized:0, ts:Date.now(), _idle:true };
+  /* Decay rolling max gently */
+  rollingMaxTotal = Math.max(3, rollingMaxTotal * 0.997);
+  rollingMaxSan   = Math.max(2, rollingMaxSan   * 0.997);
+}
+
+function getView(){
+  const v=[];
+  const len=rtData.length;
+  for(let i=0;i<RT_POINTS;i++)
+    v.push(rtData[(rtHead - RT_POINTS + 1 + i + len*4) % len]);
+  return v;
+}
+
+function refreshCounters(){
+  const view=getView();
+  const sumT=view.reduce((s,d)=>s+(d._idle?0:d.total),0);
+  const sumS=view.reduce((s,d)=>s+(d._idle?0:d.sanitized),0);
+  document.getElementById('rc-total').textContent=sumT.toLocaleString();
+  document.getElementById('rc-san').textContent  =sumS.toLocaleString();
+}
+
+/* ── rAF main loop ── */
+function rtLoop(now){
+  requestAnimationFrame(rtLoop);
+
+  /* Update blend smoothly */
+  const sinceEvent = now - lastEventTs;
+  if(gState === ST.ACTIVE){
+    blend = Math.min(1, blend + 0.06);
+    if(sinceEvent > 280) gState = ST.COOLING;
+  } else if(gState === ST.COOLING){
+    const coolFrac = clamp01((sinceEvent - 280) / COOLDOWN_MS);
+    blend = 1 - smoothstep(coolFrac);
+    if(coolFrac >= 1){ gState=ST.IDLE; blend=0; }
+  } else {
+    blend = Math.max(0, blend - 0.025);
+  }
+
+  /* Scroll speed: faster when active */
+  const speed = 0.45 + blend * 2.2;
+  scrollPx += speed;
+  const W = barCanvas.width;
+  const slotW = W / RT_POINTS;
+  if(scrollPx >= slotW){ scrollPx -= slotW; stampIdle(); }
+
+  idlePhase += 0.018;
+  barPhase  += 0.026;
 
   drawFrame(now);
 }
 
 /* ── Draw one frame ── */
-function drawFrame(now) {
-  const W = barCanvas.width, H = barCanvas.height;
-  const bCtx = barCanvas.getContext('2d');
-  const lCtx = lineCanvas.getContext('2d');
-  bCtx.clearRect(0, 0, W, H);
-  lCtx.clearRect(0, 0, W, H);
+function drawFrame(now){
+  const W=barCanvas.width, H=barCanvas.height;
+  const bCtx=barCanvas.getContext('2d');
+  const lCtx=lineCanvas.getContext('2d');
+  bCtx.clearRect(0,0,W,H);
+  lCtx.clearRect(0,0,W,H);
 
-  const PT = 10, PB = 6;
-  const gH = H - PT - PB;
-  const slotW = W / RT_POINTS;
-  const shift = scrollPx;
-  const view  = getView();
+  const PT=10, PB=6;
+  const gH=H-PT-PB;
+  const slotW=W/RT_POINTS;
+  const shift=scrollPx % slotW;
+  const view=getView();
 
-  /* BG flash when active */
-  if (blend > 0.08) {
-    bCtx.fillStyle = `rgba(0,185,255,${(blend * 0.05).toFixed(3)})`;
-    bCtx.fillRect(0, 0, W, H);
+  /* ── Canvas background flash on spike ── */
+  if(blend > 0.05){
+    bCtx.fillStyle=`rgba(0,200,255,${(blend*0.04).toFixed(3)})`;
+    bCtx.fillRect(0,0,W,H);
   }
 
   /* ── GRID ── */
-  const ga = 0.04 + blend * 0.04;
-  bCtx.strokeStyle = `rgba(255,255,255,${ga.toFixed(3)})`; bCtx.lineWidth = 1;
-  for (let r = 0; r <= 4; r++) {
-    const y = PT + (r / 4) * gH;
-    bCtx.beginPath(); bCtx.moveTo(0, y); bCtx.lineTo(W, y); bCtx.stroke();
+  const ga=0.035+blend*0.03;
+  bCtx.strokeStyle=`rgba(255,255,255,${ga})`; bCtx.lineWidth=1;
+  for(let r=0;r<=4;r++){
+    const y=PT+(r/4)*gH;
+    bCtx.beginPath(); bCtx.moveTo(0,y); bCtx.lineTo(W,y); bCtx.stroke();
   }
-  bCtx.strokeStyle = `rgba(255,255,255,${(ga * 0.4).toFixed(3)})`;
-  for (let i = 0; i < RT_POINTS; i += 20) {
-    const x = i * slotW - shift;
-    if (x < 0 || x > W) continue;
-    bCtx.beginPath(); bCtx.moveTo(x, PT); bCtx.lineTo(x, PT + gH); bCtx.stroke();
+  bCtx.strokeStyle=`rgba(255,255,255,${ga*0.5})`;
+  for(let i=0;i<RT_POINTS;i+=20){
+    const x=i*slotW-shift;
+    if(x<0||x>W) continue;
+    bCtx.beginPath(); bCtx.moveTo(x,PT); bCtx.lineTo(x,PT+gH); bCtx.stroke();
   }
 
-  /* ── BARS (total requests) ── */
-  for (let i = 0; i < RT_POINTS; i++) {
-    const d = view[i];
-    const x = i * slotW - shift;
-    if (x + slotW < 0 || x > W) continue;
+  /* ── BARS ── */
+  for(let i=0;i<RT_POINTS;i++){
+    const d=view[i];
+    const x=i*slotW - shift;
+    if(x+slotW<0 || x>W) continue;
 
     let barH;
-    if (d._idle || d.total === 0) {
-      /* Idle breathing bars — always visible 12–38% height */
-      const wave = (Math.sin(barPhase + i * 0.30) * 0.5 + 0.5);
-      barH = (0.12 + wave * 0.26) * gH * (1 - blend * 0.7);
+    if(d._idle || d.total===0){
+      /* Idle: breathing sine bars — clearly visible, 15-40% height */
+      const wave=(Math.sin(barPhase+i*0.28)*0.5+0.5);
+      const amp=0.15+wave*0.25;
+      barH = amp * gH * (1 - blend*0.55);
     } else {
-      /* Real data — minimum 40% height, scales to 100% */
+      /* Real data: scale to full height range */
       const ratio = clamp01(d.total / Math.max(1, rollingMaxTotal));
-      barH = (0.40 + ratio * 0.60) * gH;
+      /* Minimum 35% so single events are always clearly visible */
+      barH = (0.35 + ratio*0.65) * gH;
+      /* Extra boost during active blend */
+      barH = barH * (0.75 + blend*0.25);
     }
 
-    const y = PT + gH - barH;
+    const y=PT+gH-barH;
 
-    /* Color transitions: dim grey-blue → vivid bright cyan */
-    const topG = Math.round(120 + blend * 85);
-    const topB = Math.round(185 + blend * 70);
-    const topA = (0.22 + blend * 0.58).toFixed(2);
+    /* Color: muted grey-blue idle → vivid cyan-blue active */
+    const topR=Math.round(0  +blend*0);
+    const topG=Math.round(130+blend*72);
+    const topB=Math.round(190+blend*65);
+    const topA=(0.28+blend*0.52).toFixed(2);
+    const botA=(0.02+blend*0.05).toFixed(2);
 
-    const grad = bCtx.createLinearGradient(0, y, 0, PT + gH);
-    grad.addColorStop(0,   `rgba(0,${topG},${topB},${topA})`);
-    grad.addColorStop(0.45,`rgba(0,${Math.round(topG * 0.65)},${topB},${(parseFloat(topA) * 0.55).toFixed(2)})`);
-    grad.addColorStop(1,   `rgba(0,25,70,0.04)`);
-    bCtx.fillStyle = grad;
-    bCtx.fillRect(Math.floor(x) + 1, Math.floor(y),
-                  Math.max(1, Math.floor(slotW) - 2), Math.ceil(barH));
+    const g=bCtx.createLinearGradient(0,y,0,PT+gH);
+    g.addColorStop(0,  `rgba(${topR},${topG},${topB},${topA})`);
+    g.addColorStop(0.5,`rgba(${topR},${Math.round(topG*0.7)},${topB},${(topA*0.6).toFixed(2)})`);
+    g.addColorStop(1,  `rgba(0,30,80,${botA})`);
+    bCtx.fillStyle=g;
+    bCtx.fillRect(Math.floor(x)+1, Math.floor(y),
+                  Math.max(1,Math.floor(slotW)-2), Math.ceil(barH));
 
-    /* Bright cap on real-data bars */
-    if (!d._idle && d.total > 0 && blend > 0.2) {
-      bCtx.fillStyle = `rgba(0,${topG},${topB},${(blend * 0.9).toFixed(2)})`;
-      bCtx.fillRect(Math.floor(x) + 1, Math.floor(y),
-                    Math.max(1, Math.floor(slotW) - 2), 2);
+    /* Top edge glow on real data bars */
+    if(!d._idle && d.total>0 && blend>0.3){
+      bCtx.fillStyle=`rgba(${topR},${topG},${topB},${(blend*0.6).toFixed(2)})`;
+      bCtx.fillRect(Math.floor(x)+1, Math.floor(y), Math.max(1,Math.floor(slotW)-2), 2);
     }
   }
 
-  /* ── BASE GLOW LINE (bottom) ── */
-  bCtx.strokeStyle = `rgba(0,175,255,${(0.2 + blend * 0.35).toFixed(2)})`;
-  bCtx.lineWidth = 1.5;
-  bCtx.shadowColor = `rgba(0,200,255,${(0.4 + blend * 0.4).toFixed(2)})`;
-  bCtx.shadowBlur = 4 + blend * 8;
-  bCtx.beginPath(); bCtx.moveTo(0, PT + gH); bCtx.lineTo(W, PT + gH); bCtx.stroke();
-  bCtx.shadowBlur = 0;
+  /* ── BASE GLOW LINE ── */
+  const baseA=0.18+blend*0.32;
+  bCtx.strokeStyle=`rgba(0,180,255,${baseA})`; bCtx.lineWidth=1.5;
+  bCtx.shadowColor=`rgba(0,200,255,${0.4+blend*0.3})`; bCtx.shadowBlur=4+blend*6;
+  bCtx.beginPath(); bCtx.moveTo(0,PT+gH); bCtx.lineTo(W,PT+gH); bCtx.stroke();
+  bCtx.shadowBlur=0;
 
-  /* ── GREEN LINE (sanitized count) ── */
-  function lineY(i) {
-    const d = view[i];
-    /* Idle: slow sine wave riding at 55–75% down */
-    const wave = Math.sin(idlePhase + i * 0.11) * 0.5 + 0.5;
-    const idleY = PT + gH * (0.58 - wave * 0.20);
+  /* ── GREEN LINE (sanitized) ── */
+  function lineY(i){
+    const d=view[i];
+    /* Idle: visible breathing sine at ~65-80% down the graph */
+    const wave=(Math.sin(idlePhase+i*0.12)*0.5+0.5);
+    const idleY=PT + gH*(0.62 - wave*0.22);
 
-    if (d._idle || d.total === 0) {
-      /* Push idle line toward bottom when active data is flowing */
-      const bottomY = PT + gH - 3;
-      return idleY * (1 - blend) + bottomY * blend;
+    if(d._idle || d.total===0){
+      /* Blend: idle↔bottom as active takes over */
+      const bottomY=PT+gH-4;
+      return idleY*(1-blend) + bottomY*blend;
     } else {
-      const ratio  = clamp01(d.sanitized / Math.max(1, rollingMaxSan));
-      /* Minimum 35% above bottom so even ratio=0 sanitized is visible */
-      const activeY = PT + gH - (0.35 + ratio * 0.65) * gH;
-      return idleY * (1 - blend) + activeY * blend;
+      const ratio=clamp01(d.sanitized/Math.max(1,rollingMaxSan));
+      /* Min 30% height so sanitized line always shows */
+      const activeY=PT+gH - (0.30+ratio*0.70)*gH;
+      return idleY*(1-blend) + activeY*blend;
     }
   }
-  function ptx(i) { return i * slotW + slotW / 2 - shift; }
+  function ptx(i){ return i*slotW+slotW/2-shift; }
 
   lCtx.save();
-  lCtx.beginPath(); lCtx.rect(0, PT - 4, W, gH + 6); lCtx.clip();
+  lCtx.beginPath(); lCtx.rect(0,PT-4,W,gH+6); lCtx.clip();
 
-  /* Line color: muted teal (idle) → vivid #00ffa3 (active) */
-  const lG = Math.round(180 + blend * 75);
-  const lB = Math.round(148 + blend * 15);
-  const lA = (0.5 + blend * 0.5).toFixed(2);
-  const lineCol = `rgba(0,${lG},${lB},${lA})`;
+  /* Line color: muted teal idle → vivid #00ffa3 active */
+  const lR=0, lG=Math.round(185+blend*70), lB=Math.round(145+blend*18);
+  const lA=(0.55+blend*0.45).toFixed(2);
+  const lineCol=`rgba(${lR},${lG},${lB},${lA})`;
 
-  /* Area fill */
-  lCtx.beginPath(); lCtx.moveTo(ptx(0), PT + gH);
-  for (let i = 0; i < RT_POINTS; i++) {
-    const x = ptx(i), y = lineY(i);
-    if (i === 0) lCtx.lineTo(x, y);
-    else {
-      const px = ptx(i - 1), py = lineY(i - 1);
-      lCtx.bezierCurveTo((px + x) / 2, py, (px + x) / 2, y, x, y);
-    }
+  /* Area fill under line */
+  lCtx.beginPath(); lCtx.moveTo(ptx(0),PT+gH);
+  for(let i=0;i<RT_POINTS;i++){
+    const x=ptx(i),y=lineY(i);
+    if(i===0) lCtx.lineTo(x,y);
+    else{ const px=ptx(i-1),py=lineY(i-1); lCtx.bezierCurveTo((px+x)/2,py,(px+x)/2,y,x,y); }
   }
-  lCtx.lineTo(ptx(RT_POINTS - 1), PT + gH); lCtx.closePath();
-  const af = lCtx.createLinearGradient(0, PT, 0, PT + gH);
-  af.addColorStop(0,    `rgba(0,${lG},${lB},${(0.14 + blend * 0.22).toFixed(2)})`);
-  af.addColorStop(0.6,  `rgba(0,${lG},${lB},0.02)`);
-  af.addColorStop(1,    `rgba(0,${lG},${lB},0)`);
-  lCtx.fillStyle = af; lCtx.fill();
+  lCtx.lineTo(ptx(RT_POINTS-1),PT+gH); lCtx.closePath();
+  const af=lCtx.createLinearGradient(0,PT,0,PT+gH);
+  af.addColorStop(0,  `rgba(${lR},${lG},${lB},${(0.12+blend*0.20).toFixed(2)})`);
+  af.addColorStop(0.6,`rgba(${lR},${lG},${lB},0.02)`);
+  af.addColorStop(1,  `rgba(${lR},${lG},${lB},0)`);
+  lCtx.fillStyle=af; lCtx.fill();
 
   /* Line stroke */
   lCtx.beginPath();
-  for (let i = 0; i < RT_POINTS; i++) {
-    const x = ptx(i), y = lineY(i);
-    if (i === 0) lCtx.moveTo(x, y);
-    else {
-      const px = ptx(i - 1), py = lineY(i - 1);
-      lCtx.bezierCurveTo((px + x) / 2, py, (px + x) / 2, y, x, y);
-    }
+  for(let i=0;i<RT_POINTS;i++){
+    const x=ptx(i),y=lineY(i);
+    if(i===0) lCtx.moveTo(x,y);
+    else{ const px=ptx(i-1),py=lineY(i-1); lCtx.bezierCurveTo((px+x)/2,py,(px+x)/2,y,x,y); }
   }
-  lCtx.strokeStyle = lineCol;
-  lCtx.lineWidth   = 1.8 + blend * 1.5;
-  lCtx.shadowColor = `rgba(0,${lG},${lB},${(0.3 + blend * 0.6).toFixed(2)})`;
-  lCtx.shadowBlur  = 3 + blend * 14;
-  lCtx.stroke(); lCtx.shadowBlur = 0;
+  lCtx.strokeStyle=lineCol;
+  lCtx.lineWidth=1.8+blend*1.4;
+  lCtx.shadowColor=`rgba(${lR},${lG},${lB},${(0.35+blend*0.55).toFixed(2)})`;
+  lCtx.shadowBlur=3+blend*12;
+  lCtx.stroke(); lCtx.shadowBlur=0;
 
-  /* ── Pulse rings ── */
-  pulseRings = pulseRings.filter(r => now - r.ts < 1000);
-  pulseRings.forEach(r => {
-    const frac   = (now - r.ts) / 1000;
-    const radius = 3 + frac * 32;
-    const alpha  = (1 - frac) * 0.65;
-    lCtx.beginPath(); lCtx.arc(r.x, r.y, radius, 0, Math.PI * 2);
-    lCtx.strokeStyle = r.isSan
-      ? `rgba(0,255,163,${alpha.toFixed(3)})`
-      : `rgba(0,200,255,${alpha.toFixed(3)})`;
-    lCtx.lineWidth = 2.5 * (1 - frac) + 0.5;
+  /* ── Pulse rings on event ── */
+  pulseRings = pulseRings.filter(r => now-r.ts < 900);
+  pulseRings.forEach(r=>{
+    const age=now-r.ts;
+    const frac=age/900;
+    const radius=4+frac*28;
+    const alpha=(1-frac)*0.55;
+    lCtx.beginPath(); lCtx.arc(r.x,r.y,radius,0,Math.PI*2);
+    lCtx.strokeStyle=`rgba(0,255,163,${alpha.toFixed(3)})`;
+    lCtx.lineWidth=1.5*(1-frac)+0.5;
     lCtx.stroke();
   });
 
   /* ── Live cursor dot ── */
-  const cx = ptx(RT_POINTS - 1);
-  const cy = lineY(RT_POINTS - 1);
-  const dotR = 3 + blend * 3.5;
-  lCtx.beginPath(); lCtx.arc(cx, cy, dotR, 0, Math.PI * 2);
-  lCtx.fillStyle   = lineCol;
-  lCtx.shadowColor = lineCol;
-  lCtx.shadowBlur  = 5 + blend * 18;
-  lCtx.fill(); lCtx.shadowBlur = 0;
+  const cx=ptx(RT_POINTS-1);
+  const cy=lineY(RT_POINTS-1);
+  const dotR=2.8+blend*3.2;
+  lCtx.beginPath(); lCtx.arc(cx,cy,dotR,0,Math.PI*2);
+  lCtx.fillStyle=lineCol;
+  lCtx.shadowColor=lineCol; lCtx.shadowBlur=5+blend*14;
+  lCtx.fill(); lCtx.shadowBlur=0;
 
-  /* ── State badge (top-left) ── */
-  const stTxt = gState === ST.IDLE ? 'IDLE' : gState === ST.ACTIVE ? 'ACTIVE' : 'COOLING';
-  const stCol = gState === ST.IDLE
-    ? 'rgba(80,110,130,0.7)'
-    : gState === ST.ACTIVE
-      ? 'rgba(0,255,163,0.95)'
-      : 'rgba(0,200,255,0.8)';
-  lCtx.font      = '700 9px "Space Mono",monospace';
-  lCtx.fillStyle = stCol;
-  lCtx.fillText('● ' + stTxt, 8, PT + 14);
+  /* ── State badge ── */
+  const stTxt = gState===ST.IDLE?'IDLE':gState===ST.ACTIVE?'ACTIVE':'COOLING';
+  const stCol = gState===ST.IDLE?'rgba(80,105,120,0.7)':
+                gState===ST.ACTIVE?'rgba(0,255,163,0.9)':'rgba(0,200,255,0.75)';
+  lCtx.font='700 9px "Space Mono",monospace';
+  lCtx.fillStyle=stCol;
+  lCtx.fillText('● '+stTxt, 8, PT+13);
 
   lCtx.restore();
 }
 
 /* ── X-axis timestamps ── */
-function updateXAxis() {
-  const view  = getView();
-  const xaxis = document.getElementById('rt-xaxis');
-  xaxis.innerHTML = '';
-  [0, 25, 50, 75, 99].forEach(i => {
-    const span = document.createElement('span');
-    span.textContent = new Date(view[i].ts).toLocaleTimeString([], {
-      hour: '2-digit', minute: '2-digit', second: '2-digit'
-    });
-    xaxis.appendChild(span);
+function updateXAxis(){
+  const view=getView();
+  const xaxis=document.getElementById('rt-xaxis');
+  xaxis.innerHTML='';
+  [0,25,50,75,99].forEach(i=>{
+    const el=document.createElement('span');
+    el.textContent=new Date(view[i].ts).toLocaleTimeString([],
+      {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    xaxis.appendChild(el);
   });
 }
 setInterval(updateXAxis, 1000);
 
-/* Start rAF loop */
+/* Start the rAF loop */
 requestAnimationFrame(rtLoop);
 
-/* ════════════════════════════════════════════════════════
-   CHART.JS SETUP
-════════════════════════════════════════════════════════ */
-Chart.defaults.color       = '#3d5260';
-Chart.defaults.font.family = "'Space Mono',monospace";
-Chart.defaults.font.size   = 10;
-const COLORS = ['#00ffa3','#00c8ff','#ffaa00','#ff4060','#a855f7','#f97316','#ec4899','#06b6d4'];
+/* ═══════════════════════════════════════════════════ */
+/* Chart.js defaults */
+Chart.defaults.color='#3d5260';
+Chart.defaults.font.family="'Space Mono',monospace";
+Chart.defaults.font.size=10;
+const COLORS=['#00ffa3','#00c8ff','#ffaa00','#ff4060','#a855f7','#f97316','#ec4899','#06b6d4'];
 
-const dailyChart = new Chart(document.getElementById('dailyChart'), {
-  type: 'line',
-  data: { labels: [], datasets: [
-    { label:'Sanitized', data:[], borderColor:'#00ffa3', backgroundColor:'rgba(0,255,163,0.07)',
-      borderWidth:2, pointBackgroundColor:'#00ffa3', pointRadius:3, tension:0.4, fill:true },
-    { label:'Total',     data:[], borderColor:'#00c8ff', backgroundColor:'rgba(0,200,255,0.04)',
-      borderWidth:1.5, pointBackgroundColor:'#00c8ff', pointRadius:2, tension:0.4, fill:true }
-  ]},
-  options: { responsive:true, plugins:{ legend:{ display:true, labels:{color:'#5a7080',boxWidth:10,padding:14} } },
-    scales:{ x:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{maxRotation:0,maxTicksLimit:7}},
-             y:{grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true} } }
-});
+const dailyChart=new Chart(document.getElementById('dailyChart'),{type:'line',data:{labels:[],datasets:[{label:'Sanitized',data:[],borderColor:'#00ffa3',backgroundColor:'rgba(0,255,163,0.07)',borderWidth:2,pointBackgroundColor:'#00ffa3',pointRadius:3,tension:0.4,fill:true}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{maxRotation:0,maxTicksLimit:7}},y:{grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true}}}});
+const typeChart=new Chart(document.getElementById('typeChart'),{type:'bar',data:{labels:[],datasets:[{label:'Count',data:[],backgroundColor:COLORS,borderRadius:5,borderSkipped:false}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true}}}});
+const provChart=new Chart(document.getElementById('provChart'),{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:COLORS,borderColor:'#111820',borderWidth:3,hoverOffset:6}]},options:{responsive:true,cutout:'65%',plugins:{legend:{position:'bottom',labels:{padding:12,boxWidth:9,font:{size:10}}}}}});
 
-const typeChart = new Chart(document.getElementById('typeChart'), {
-  type: 'bar',
-  data: { labels: [], datasets: [{ label:'Count', data:[], backgroundColor:COLORS, borderRadius:5, borderSkipped:false }] },
-  options: { responsive:true, plugins:{legend:{display:false}},
-    scales:{ x:{grid:{display:false}}, y:{grid:{color:'rgba(255,255,255,0.04)'},beginAtZero:true} } }
-});
+let wsAttempts=0, feedCount=0;
 
-const provChart = new Chart(document.getElementById('provChart'), {
-  type: 'doughnut',
-  data: { labels: [], datasets: [{ data:[], backgroundColor:COLORS, borderColor:'#111820', borderWidth:3, hoverOffset:6 }] },
-  options: { responsive:true, cutout:'65%',
-    plugins:{ legend:{ position:'bottom', labels:{padding:12,boxWidth:9,font:{size:10}} } } }
-});
-
-/* ════════════════════════════════════════════════════════
-   STATE
-════════════════════════════════════════════════════════ */
-let wsAttempts = 0;
-let feedCount  = 0;
-
-/* ════════════════════════════════════════════════════════
-   WS LOG + CHIP
-════════════════════════════════════════════════════════ */
-function wsLog(msg, cls = '') {
-  const log  = document.getElementById('ws-log');
-  const wait = log.querySelector('.ws-wait');
-  if (wait) wait.remove();
-  const el = document.createElement('div');
-  el.className  = 'wse' + (cls ? ' ' + cls : '');
-  el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+function wsLog(msg,cls=''){
+  const log=document.getElementById('ws-log');
+  const wait=log.querySelector('.ws-wait'); if(wait) wait.remove();
+  const el=document.createElement('div');
+  el.className='wse'+(cls?' '+cls:'');
+  el.textContent=`[${new Date().toLocaleTimeString()}] ${msg}`;
   log.prepend(el);
-  while (log.children.length > 14) log.lastChild.remove();
+  while(log.children.length>14) log.lastChild.remove();
+}
+function setChip(lbl,ok){
+  document.getElementById('ws-chip').className='status-chip '+(ok?'connected':'offline');
+  document.getElementById('ws-chip-lbl').textContent=lbl;
 }
 
-function setChip(lbl, ok) {
-  document.getElementById('ws-chip').className = 'status-chip ' + (ok ? 'connected' : 'offline');
-  document.getElementById('ws-chip-lbl').textContent = lbl;
-}
-
-/* ════════════════════════════════════════════════════════
-   WEBSOCKET CONNECTION
-   api.py sends {"summary":{...}, "daily_counts":{...},
-                 "type_distribution":{...}, "provider_distribution":{...}}
-   on EVERY /event POST and on initial connect.
-════════════════════════════════════════════════════════ */
-const WS_URL = 'ws://127.0.0.1:8000/ws';
-let ws, rtimer;
-
-function connectWS() {
+const WS_URL='ws://127.0.0.1:8000/ws';
+let ws,rtimer;
+function connectWS(){
   wsAttempts++;
-  document.getElementById('ws-att').textContent = wsAttempts;
+  document.getElementById('ws-att').textContent=wsAttempts;
   wsLog(`Connecting to ${WS_URL}…`);
-  try { ws = new WebSocket(WS_URL); } catch(e) { schedRecon(); return; }
-
-  ws.onopen = () => {
-    wsLog('Connected ✓', 'ok');
-    setChip('Connected', true);
-    clearTimeout(rtimer);
-    prevSnap = null;   /* reset so first message is treated as baseline */
-  };
-
-  ws.onerror = () => wsLog('✕ Error connecting to ' + WS_URL, 'err');
-
-  ws.onclose = () => {
-    wsLog('⚡ Disconnected', 'warn');
-    setChip('Disconnected', false);
-    schedRecon();
-  };
-
-  ws.onmessage = e => {
+  try { ws=new WebSocket(WS_URL); } catch(e){schedRecon();return;}
+  ws.onopen =()=>{ wsLog('Connected ✓','ok'); setChip('Connected',true); clearTimeout(rtimer); };
+  ws.onerror=()=>wsLog('✕ Connection error to '+WS_URL,'err');
+  ws.onclose=()=>{ wsLog('⚡ Disconnected','warn'); setChip('Disconnected',false); schedRecon(); };
+  ws.onmessage=e=>{
     try {
-      const msg = JSON.parse(e.data);
-      /* api.py always sends the full snapshot shape */
-      if (msg.summary) {
-        handleSnapshot(msg);
-      }
-    } catch(ex) {
-      wsLog('Parse error: ' + ex.message, 'err');
-    }
+      const msg=JSON.parse(e.data);
+      if(msg.summary)                         handleDashboard(msg);
+      else if(msg.type==='dashboard_update')  handleDashboard(msg.data);
+      else if(msg.type==='event'||msg.event_type) handleEvent(msg.data||msg);
+    } catch(ex){ wsLog('Parse error: '+ex.message,'err'); }
   };
 }
-
-function schedRecon() {
-  clearTimeout(rtimer);
-  rtimer = setTimeout(connectWS, 4000);
-}
-
+function schedRecon(){ clearTimeout(rtimer); rtimer=setTimeout(connectWS,4000); }
 connectWS();
 
-/* ════════════════════════════════════════════════════════
-   HANDLE SNAPSHOT  (the ONLY message shape api.py sends)
-   ────────────────────────────────────────────────────────
-   Called on:
-   • Initial connect (prevSnap=null → treat as baseline, show counts)
-   • Every /event POST → compute delta → rtPush(delta) → spike graph
-════════════════════════════════════════════════════════ */
-function handleSnapshot(data) {
-  const s = data.summary;
+function updateTokenDisplay(inp,out){
+  tokIn=inp; tokOut=out;
+  document.getElementById('t-in').textContent =(inp).toLocaleString();
+  document.getElementById('t-out').textContent=(out).toLocaleString();
+  document.getElementById('t-tot').textContent=(inp+out).toLocaleString();
+}
 
-  const isFirst   = prevSnap === null;
-  const prev      = isFirst ? { total_requests:0, total_sanitized:0, total_restored:0 } : prevSnap;
-
-  /* ── Deltas since last snapshot ── */
-  const dTotal = Math.max(0, s.total_requests  - prev.total_requests);
-  const dSan   = Math.max(0, s.total_sanitized - prev.total_sanitized);
-  const dRest  = Math.max(0, s.total_restored  - prev.total_restored);
-
-  /* Save snapshot */
-  prevSnap = {
-    total_requests:  s.total_requests,
-    total_sanitized: s.total_sanitized,
-    total_restored:  s.total_restored
-  };
-
-  /* ── Stat cards ── */
-  animCount('s-total', s.total_requests,  document.getElementById('sc-total'));
-  animCount('s-san',   s.total_sanitized, document.getElementById('sc-san'));
-  document.getElementById('s-rate').textContent  = s.protection_rate + '%';
-  document.getElementById('s-risk').textContent  = s.average_risk_score || 0;
-  document.getElementById('req-badge').textContent = s.total_requests + ' requests';
-
-  /* ── RT GRAPH: spike on every delta ── */
-  /* On first connect: if backend already has data, spike once with totals */
-  if (isFirst && s.total_requests > 0) {
-    rtPush(s.total_requests, s.total_sanitized);
-  } else if (!isFirst && (dTotal > 0 || dSan > 0 || dRest > 0)) {
-    /* Every subsequent broadcast: push the incremental counts */
-    rtPush(Math.max(dTotal, dSan + dRest), dSan);
-  }
-
-  /* ── Synthesize live feed entry on new events ── */
-  if (!isFirst && (dSan > 0 || dRest > 0)) {
-    /* Find which provider changed most */
-    const curProv  = data.provider_distribution || {};
-    const prevProv = prevSnapProviders || {};
-    let topProvider = Object.keys(curProv)[0] || 'unknown';
-    let topDelta = 0;
-    for (const [k, v] of Object.entries(curProv)) {
-      const d = v - (prevProv[k] || 0);
-      if (d > topDelta) { topDelta = d; topProvider = k; }
-    }
-
-    /* Find new PII types */
-    const curTyps  = data.type_distribution || {};
-    const prevTyps = prevSnapTypes || {};
-    const newTypes = [];
-    for (const [k, v] of Object.entries(curTyps)) {
-      const d = v - (prevTyps[k] || 0);
-      for (let i = 0; i < Math.min(d, 4); i++) newTypes.push(k);
-    }
-
-    const ts = new Date().toISOString();
-
-    if (dSan > 0) {
-      feedCount++;
-      document.getElementById('feed-num').textContent = feedCount;
-      document.getElementById('feed-empty')?.remove();
-      addFeedCard({
-        label: 'Sanitized', cls: 'san',
-        domain: topProvider, types: newTypes, ts,
-        risk: s.average_risk_score
-      });
-      addTableEntry({
-        eventLabel: 'SANITIZED',
-        domain: topProvider, types: newTypes, ts,
-        riskColor: 'var(--accent)'
-      });
-      wsLog(`Sanitized · ${topProvider} · ${newTypes.length} PII type(s)`, 'ok');
-    }
-    if (dRest > 0) {
-      feedCount++;
-      document.getElementById('feed-num').textContent = feedCount;
-      document.getElementById('feed-empty')?.remove();
-      addFeedCard({ label: 'Restored', cls: 'res', domain: topProvider, types: [], ts });
-      addTableEntry({ eventLabel: 'RESTORED', domain: topProvider, types: [], ts, riskColor: 'var(--accent2)' });
-      wsLog(`Restored · ${topProvider}`, 'warn');
-    }
-    if (dTotal > 0 && dSan === 0 && dRest === 0) {
-      wsLog(`Request · ${topProvider} · no PII detected`);
-    }
-  }
-
-  /* Save provider/type snapshot for next diff */
-  prevSnapProviders = { ...(data.provider_distribution || {}) };
-  prevSnapTypes     = { ...(data.type_distribution     || {}) };
-
-  /* ── Chart.js charts ── */
-  const daily = data.daily_counts || {};
-  /* api.py daily_counts = { "YYYY-MM-DD": int } (sanitized count only) */
-  const dk = Object.keys(daily).sort().slice(-14);
-  dailyChart.data.labels = dk.map(k => k.slice(5));   /* "MM-DD" */
-  dailyChart.data.datasets[0].data = dk.map(k => {
-    const v = daily[k];
-    return (typeof v === 'object') ? (v.sanitized || 0) : v;
-  });
-  /* Total line: same values since api.py only tracks sanitized in daily */
-  dailyChart.data.datasets[1].data = dailyChart.data.datasets[0].data.map(v => v);
+function handleDashboard(data){
+  const s=data.summary;
+  animCount('s-total',s.total_requests,  document.getElementById('sc-total'));
+  animCount('s-san',  s.total_sanitized, document.getElementById('sc-san'));
+  document.getElementById('s-rate').textContent=s.protection_rate+'%';
+  document.getElementById('s-risk').textContent=s.average_risk_score;
+  document.getElementById('req-badge').textContent=s.total_requests+' requests';
+  if(s.total_input_tokens!=null) updateTokenDisplay(s.total_input_tokens,s.total_output_tokens||0);
+  const daily=data.daily_counts||{};
+  const dk=Object.keys(daily).sort().slice(-14);
+  dailyChart.data.labels=dk.map(k=>k.slice(5));
+  dailyChart.data.datasets[0].data=dk.map(k=>{const v=daily[k];return typeof v==='object'?(v.sanitized||0):v;});
   dailyChart.update('active');
-
-  const te = Object.entries(data.type_distribution || {}).sort((a, b) => b[1] - a[1]).slice(0, 8);
-  typeChart.data.labels = te.map(([k]) => k);
-  typeChart.data.datasets[0].data = te.map(([, v]) => v);
+  const te=Object.entries(data.type_distribution||{}).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  typeChart.data.labels=te.map(([k])=>k);
+  typeChart.data.datasets[0].data=te.map(([,v])=>v);
   typeChart.update('active');
-
-  const pd = Object.entries(data.provider_distribution || {}).sort((a, b) => b[1] - a[1]);
-  provChart.data.labels = pd.map(([k]) => k);
-  provChart.data.datasets[0].data = pd.map(([, v]) => v);
+  const pd=data.provider_distribution||{};
+  provChart.data.labels=Object.keys(pd);
+  provChart.data.datasets[0].data=Object.values(pd);
   provChart.update('active');
-
-  if (isFirst) wsLog(`Synced · ${s.total_requests} reqs · ${s.total_sanitized} sanitized`, 'ok');
 }
 
-/* Extra snapshot state for diffs */
-let prevSnapProviders = null;
-let prevSnapTypes     = null;
-
-/* ════════════════════════════════════════════════════════
-   UI HELPERS: feed card + table row
-════════════════════════════════════════════════════════ */
-const TYPE_CLS = {
-  EMAIL:'email', PHONE:'phone', PAN_CARD:'ssn', CREDIT_CARD:'cc',
-  OPENAI_KEY:'ip', AWS_ACCESS_KEY:'name', JWT_TOKEN:'addr'
-};
-
-function typeTags(types, max) {
-  return types.slice(0, max).map(t => {
-    const c = TYPE_CLS[t] || 'other';
-    return `<span class="type-tag ${c}">${t}</span>`;
-  }).join('') + (types.length > max ? `<span class="type-tag other">+${types.length - max} more</span>` : '');
+function handleEvent(ev){
+  feedCount++;
+  document.getElementById('feed-num').textContent=feedCount;
+  addFeedItem(ev); addTableRow(ev);
+  const inTok=ev.input_tokens||0, outTok=ev.output_tokens||0;
+  if(inTok||outTok) updateTokenDisplay(tokIn+inTok,tokOut+outTok);
+  /* Every event = 1 graph data point pushed immediately */
+  const san= (ev.event_type==='SANITIZED_REQUEST') ||
+             (ev.types_detected && Object.keys(ev.types_detected).length>0) ? 1 : 0;
+  rtPush(1, san);   // ← triggers scroll animation instantly
+  /* Update req badge */
+  const cur=parseInt(document.getElementById('req-badge').textContent)||0;
+  document.getElementById('req-badge').textContent=(cur+1)+' requests';
 }
 
-function addFeedCard({ label, cls, domain, types, ts, risk }) {
-  const scroll = document.getElementById('feed-scroll');
-  const time   = ts ? new Date(ts).toLocaleTimeString() : new Date().toLocaleTimeString();
-  const riskCls = risk == null ? '' : risk > 6.5 ? 'high' : risk > 3.5 ? 'med' : 'low';
-  const el = document.createElement('div');
-  el.className = 'fitem';
-  el.innerHTML = `
-    <div class="fitem-top">
-      <span class="fevt ${cls}">${label}</span>
-      <span class="ftim">${time}</span>
-    </div>
-    <div class="fdom">${domain || '—'}</div>
-    <div class="fmeta">
-      ${typeTags(types, 4)}
-      ${risk != null ? `<span class="frisk ${riskCls}">Risk: ${risk}</span>` : ''}
-    </div>`;
+function addFeedItem(ev){
+  const scroll=document.getElementById('feed-scroll');
+  document.getElementById('feed-empty')?.remove();
+  const map={SANITIZED_REQUEST:['san','Sanitized'],RESTORED_RESPONSE:['res','Restored'],THREAT_DETECTED:['thr','Threat']};
+  const [cls,lbl]=map[ev.event_type]||['san',ev.event_type||'EVENT'];
+  const risk=ev.risk_score!=null?ev.risk_score:null;
+  const rc=risk==null?'':risk>6.5?'high':risk>3.5?'med':'low';
+  const t=new Date(ev.timestamp||Date.now()).toLocaleTimeString();
+  const el=document.createElement('div'); el.className='fitem';
+  el.innerHTML=`<div class="fitem-top"><span class="fevt ${cls}">${lbl}</span><span class="ftim">${t}</span></div>
+    <div class="fdom">${ev.domain||ev.provider||'—'}</div>
+    <div class="fmeta"><span>${ev.provider||''}</span>
+    ${ev.method?`<span>${ev.method} ${ev.path||''}</span>`:''}
+    ${ev.total_replacements?`<span>${ev.total_replacements} replacements</span>`:''}
+    ${risk!=null?`<span class="frisk ${rc}">Risk: ${risk}</span>`:''}</div>`;
   scroll.prepend(el);
-  while (scroll.children.length > 60) scroll.lastChild.remove();
+  while(scroll.children.length>60) scroll.lastChild.remove();
 }
 
-function addTableEntry({ eventLabel, domain, types, ts, riskColor }) {
-  const tbody = document.getElementById('rtbody');
+function addTableRow(ev){
+  const tbody=document.getElementById('rtbody');
   document.getElementById('empty-row')?.remove();
-  const time = ts ? new Date(ts).toLocaleTimeString() : new Date().toLocaleTimeString();
-  const tr   = document.createElement('tr');
-  tr.className = 'tr-anim';
-  tr.innerHTML = `
-    <td>${typeTags(types, 3) || `<span class="type-tag other">${eventLabel}</span>`}</td>
-    <td class="data-cell"><b>${domain || '—'}</b></td>
-    <td><span style="font-family:var(--mono);font-size:.7rem;color:${riskColor}">${eventLabel}</span></td>
-    <td class="tok-num">${types.length || '—'}</td>
-    <td class="time-lbl">${time}</td>`;
+  const types=ev.types_detected?Object.keys(ev.types_detected):(ev.event_type?[ev.event_type]:['OTHER']);
+  const risk=ev.risk_score!=null?ev.risk_score:'—';
+  const rc=typeof risk==='number'?(risk>6.5?'var(--danger)':risk>3.5?'var(--warn)':'var(--accent)'):'var(--muted2)';
+  const tokens=(ev.input_tokens||0)+(ev.output_tokens||0);
+  const t=new Date(ev.timestamp||Date.now()).toLocaleTimeString();
+  const tags=types.slice(0,3).map(tp=>{const k=tp.toLowerCase().replace(/[^a-z]/g,'');const c=['email','phone','ssn','cc','ip','name','addr','dob'].includes(k)?k:'other';return`<span class="type-tag ${c}">${tp}</span>`;}).join('');
+  const tr=document.createElement('tr'); tr.className='tr-anim';
+  tr.innerHTML=`<td>${tags}</td><td class="data-cell"><b>${ev.domain||ev.provider||'—'}</b>${ev.path?' '+ev.path:''}</td><td><span style="font-family:var(--mono);font-size:.7rem;color:${rc}">${risk}</span></td><td class="tok-num">${tokens>0?tokens.toLocaleString():'—'}</td><td class="time-lbl">${t}</td>`;
   tbody.prepend(tr);
-  while (tbody.children.length > 80) tbody.lastChild.remove();
+  while(tbody.children.length>80) tbody.lastChild.remove();
 }
 
-/* ════════════════════════════════════════════════════════
-   ANIMATED COUNT
-════════════════════════════════════════════════════════ */
-function animCount(id, target, card) {
-  const el    = document.getElementById(id);
-  const start = parseInt(el.textContent.replace(/\D/g, '')) || 0;
-  if (start === target) return;
-  if (card) { card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash'); }
-  const diff = target - start, dur = 700, t0 = performance.now();
-  (function f(t) {
-    const p = Math.min((t - t0) / dur, 1);
-    const e = 1 - Math.pow(1 - p, 3);
-    el.textContent = Math.round(start + diff * e).toLocaleString();
-    if (p < 1) requestAnimationFrame(f);
-  })(t0);
+function animCount(id,target,card){
+  const el=document.getElementById(id);
+  const start=parseInt(el.textContent.replace(/\D/g,''))||0;
+  if(start===target)return;
+  if(card){card.classList.remove('flash');void card.offsetWidth;card.classList.add('flash');}
+  const diff=target-start,dur=700,t0=performance.now();
+  (function f(t){const p=Math.min((t-t0)/dur,1),e=1-Math.pow(1-p,3);el.textContent=Math.round(start+diff*e).toLocaleString();if(p<1)requestAnimationFrame(f);})(t0);
 }
 
-/* ════════════════════════════════════════════════════════
-   DEMO MODE
-   ────────────────────────────────────────────────────────
-   Simulates what api.py would broadcast after each /event.
-   Uses handleSnapshot() exactly like real WS messages do.
-   Stops automatically when real WS connects.
-════════════════════════════════════════════════════════ */
-(function demoMode() {
+/* ═══════════════════════════════════════════════════
+   DEMO MODE — realistic burst / quiet cycle
+   Fires rtPush() with real total/sanitized counts.
+   Between bursts: graph stays in IDLE sine wave.
+   Spikes are large enough (5-20) to be very visible.
+═══════════════════════════════════════════════════ */
+(function demoMode(){
   let active = true;
-  setTimeout(() => { if (ws && ws.readyState === 1) active = false; }, 5000);
+  setTimeout(()=>{ if(ws && ws.readyState===1) active=false; }, 6500);
 
-  /* Simulated cumulative state (mirrors api.py analytics{}) */
-  const sim = {
-    total_requests:  0,
-    total_sanitized: 0,
-    total_restored:  0,
-    risk_total:      0,
-    type_counts:     {},
-    provider_counts: {},
-    daily_counts:    {}
-  };
+  let tick=0, inBurst=false, burstLeft=0;
 
-  const DOMAINS  = ['gemini.google.com','chatgpt.com','claude.ai','openai.com','copilot.microsoft.com'];
-  const PII_TYPES = ['EMAIL','PHONE','PAN_CARD','CREDIT_CARD','JWT_TOKEN','AWS_ACCESS_KEY','OPENAI_KEY'];
+  function fire(){
+    if(!active){ setTimeout(fire, 1000); return; }
+    tick++;
 
-  function randItem(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-
-  function buildPayload() {
-    const rate = sim.total_requests > 0
-      ? round2(sim.total_sanitized / sim.total_requests * 100) : 0;
-    const avgRisk = sim.total_sanitized > 0
-      ? round2(sim.risk_total / sim.total_sanitized) : 0;
-    return {
-      summary: {
-        total_requests:   sim.total_requests,
-        total_sanitized:  sim.total_sanitized,
-        total_restored:   sim.total_restored,
-        protection_rate:  rate,
-        average_risk_score: avgRisk
-      },
-      daily_counts:         { ...sim.daily_counts },
-      type_distribution:    { ...sim.type_counts },
-      provider_distribution: { ...sim.provider_counts }
-    };
-  }
-
-  function round2(n) { return Math.round(n * 100) / 100; }
-
-  function simEvent(isSan) {
-    const domain = randItem(DOMAINS);
-    sim.total_requests++;
-
-    const dateKey = new Date().toISOString().slice(0, 10);
-    sim.daily_counts[dateKey] = (sim.daily_counts[dateKey] || 0);
-
-    if (isSan) {
-      sim.total_sanitized++;
-      sim.daily_counts[dateKey]++;
-      const numTypes = Math.floor(Math.random() * 3) + 1;
-      for (let i = 0; i < numTypes; i++) {
-        const t = randItem(PII_TYPES);
-        sim.type_counts[t] = (sim.type_counts[t] || 0) + 1;
-      }
-      sim.provider_counts[domain] = (sim.provider_counts[domain] || 0) + 1;
-      sim.risk_total += Math.random() * 8 + 1;
-    } else {
-      sim.total_restored++;
-    }
-
-    handleSnapshot(buildPayload());
-  }
-
-  /* Organic burst / quiet pattern */
-  let inBurst = false, burstLeft = 0;
-
-  function fire() {
-    if (!active) { setTimeout(fire, 1200); return; }
-
-    if (!inBurst) {
-      if (Math.random() > 0.55) {
+    if(!inBurst){
+      if(Math.random() > 0.60){
         inBurst   = true;
-        burstLeft = Math.floor(Math.random() * 12) + 3;
+        burstLeft = Math.floor(Math.random()*14)+4;
       }
-      setTimeout(fire, 600 + Math.random() * 900);
+      setTimeout(fire, 500+Math.random()*800);
       return;
     }
 
-    simEvent(Math.random() > 0.30);  /* 70% sanitized, 30% restored */
-    burstLeft--;
+    /* Burst: push REAL data — values large enough for visible bars */
+    const spike   = burstLeft>10 && Math.random()>.55 ? Math.floor(Math.random()*12)+6 : 0;
+    const base    = Math.floor(Math.abs(Math.sin(tick*0.35))*3)+2;
+    const total   = base + spike;
+    const san     = Math.min(total, Math.round(total*(0.65+Math.random()*0.28)));
 
-    if (burstLeft <= 0) {
-      inBurst = false;
-      setTimeout(fire, 2000 + Math.random() * 3000);
+    rtPush(total, san);
+
+    updateTokenDisplay(
+      tokIn  + total*(Math.floor(Math.random()*90)+40),
+      tokOut + san  *(Math.floor(Math.random()*40)+15)
+    );
+    const cur=parseInt(document.getElementById('req-badge').textContent)||0;
+    document.getElementById('req-badge').textContent=(cur+total)+' requests';
+
+    burstLeft--;
+    if(burstLeft<=0){
+      inBurst=false;
+      setTimeout(fire, 1800+Math.random()*2800); // quiet gap
     } else {
-      setTimeout(fire, 50 + Math.random() * 130);
+      setTimeout(fire, 60+Math.random()*160);    // rapid burst
     }
   }
 
-  setTimeout(fire, 3500);
+  setTimeout(fire, 3600);
 })();
 </script>
 </body>
